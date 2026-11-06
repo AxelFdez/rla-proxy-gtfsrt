@@ -6,7 +6,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY filter.js server.js ./
+COPY *.js ./
 
 USER node
 EXPOSE 3000

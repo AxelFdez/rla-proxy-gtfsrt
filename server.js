@@ -1,23 +1,71 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
-import { filterFeed, parsePrefixes } from './filter.js';
+import { filterFeed, mergeFeeds, parseList } from './filter.js';
+import { tripRoutesFromGtfs } from './gtfs-static.js';
 
 const { FeedMessage } = GtfsRealtimeBindings.transit_realtime;
 
-const SRC_URL =
-  process.env.SRC_URL ?? 'https://proxy-data.zou.maregionsud.fr/GTFS-RT/GTFS-RT_trips_ZOU_express.pb';
-const TRIP_PREFIXES = parsePrefixes(process.env.TRIP_PREFIXES ?? 'CFP:');
+// Each source is "<GTFS-RT TripUpdate URL>|<GTFS static zip URL>". The static
+// GTFS gives trip_id -> route_id, since route_id is empty in the ZOU feeds.
+const DEFAULT_SOURCES = [
+  // ZOU Express (CFP, SNCF, ZOE, MCN)
+  'https://proxy-data.zou.maregionsud.fr/GTFS-RT/GTFS-RT_trips_ZOU_express.pb' +
+    '|https://www.data.gouv.fr/api/1/datasets/r/1164d75b-4a9f-4c5a-b765-31d861b34fda',
+  // ZOU Proximité (ZOP)
+  'https://proxy-data.zou.maregionsud.fr/GTFS-RT/GTFS-RT_trips_ZOU_proximite.pb' +
+    '|https://www.data.gouv.fr/api/1/datasets/r/9c8116cb-2f1a-4045-b149-c5bf6cae6bef',
+].join(',');
+const DEFAULT_ROUTE_IDS = [
+  'CFP:0-1', 'CFP:0-2',
+  'ZOP:600', 'ZOP:602', 'ZOP:620', 'ZOP:622', 'ZOP:632', 'ZOP:637',
+  'ZOP:650', 'ZOP:670', 'ZOP:671', 'ZOP:672', 'ZOP:675',
+].join(',');
+
+const ROUTE_IDS = new Set(parseList(process.env.ROUTE_IDS ?? DEFAULT_ROUTE_IDS));
 const PORT = Number(process.env.PORT ?? 3000);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS ?? 15000);
 const MAX_STALE_MS = Number(process.env.MAX_STALE_MS ?? 120000);
+const GTFS_REFRESH_MS = Number(process.env.GTFS_REFRESH_MS ?? 6 * 3600 * 1000);
 const UPSTREAM_TIMEOUT_MS = 8000;
+const GTFS_TIMEOUT_MS = 60000;
+const GTFS_RETRY_MS = 60000;
 
 // Comma-separated, so a key can be rotated by deploying old+new side by side.
-const API_KEYS = parsePrefixes(process.env.API_KEYS);
+const API_KEYS = parseList(process.env.API_KEYS);
 
-if (TRIP_PREFIXES.length === 0) {
-  console.error('TRIP_PREFIXES is empty, refusing to start');
+const sources = parseList(process.env.SOURCES ?? DEFAULT_SOURCES).map((s) => {
+  const [rtUrl, gtfsUrl] = s.split('|').map((u) => u?.trim());
+  if (!rtUrl || !gtfsUrl) {
+    console.error(`invalid SOURCES entry "${s}", expected "<gtfs-rt url>|<gtfs zip url>"`);
+    process.exit(1);
+  }
+  return {
+    name: new URL(rtUrl).pathname.split('/').pop().replace(/\.pb$/, ''),
+    rtUrl,
+    gtfsUrl,
+    tripRoutes: null, // Map trip_id -> route_id
+    gtfsLoadedAt: 0,
+    gtfsLastAttempt: 0,
+    gtfsInflight: null,
+    // Last good filtered feed. fetchedAt = last successful contact with the
+    // RT upstream (200 or 304), what CACHE_TTL_MS and MAX_STALE_MS apply to.
+    feed: null,
+    version: 0,
+    etag: null,
+    lastModified: null,
+    upstreamEntities: null,
+    fetchedAt: 0,
+    inflight: null,
+  };
+});
+
+if (ROUTE_IDS.size === 0) {
+  console.error('ROUTE_IDS is empty, refusing to start');
+  process.exit(1);
+}
+if (sources.length === 0) {
+  console.error('SOURCES is empty, refusing to start');
   process.exit(1);
 }
 if (API_KEYS.length === 0) {
@@ -40,13 +88,45 @@ function isAuthorized(req, url) {
   return API_KEY_DIGESTS.some((k) => timingSafeEqual(k, d));
 }
 
-// Last good filtered feed. fetchedAt = last successful contact with upstream
-// (200 or 304), which is what the TTL and MAX_STALE_MS are measured against.
-let cache = null; // { body, etag, lastModified, upstreamBytes, upstreamEntities, keptEntities, fetchedAt }
-let inflight = null;
-
 function log(fields) {
   process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...fields }) + '\n');
+}
+
+const errorMessage = (err, timeoutMs) =>
+  err.name === 'TimeoutError' ? `timeout after ${timeoutMs} ms` : err.message;
+
+async function loadGtfs(src) {
+  src.gtfsLastAttempt = Date.now();
+  try {
+    const res = await fetch(src.gtfsUrl, { signal: AbortSignal.timeout(GTFS_TIMEOUT_MS) });
+    if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
+    const zip = Buffer.from(await res.arrayBuffer());
+    const tripRoutes = tripRoutesFromGtfs(zip);
+    const wanted = [...tripRoutes.values()].filter((r) => ROUTE_IDS.has(r)).length;
+    src.tripRoutes = tripRoutes;
+    src.gtfsLoadedAt = Date.now();
+    // Force a full RT download so the new mapping applies right away
+    // instead of waiting for the upstream feed to change.
+    src.etag = null;
+    log({ source: src.name, status: 'gtfs_loaded', gtfs_bytes: zip.length, trips: tripRoutes.size, wanted_trips: wanted });
+  } catch (err) {
+    // Keep the previous mapping, if any: an old trips.txt beats no filter.
+    log({ source: src.name, status: 'gtfs_error', error: errorMessage(err, GTFS_TIMEOUT_MS), has_previous: !!src.tripRoutes });
+  }
+}
+
+function ensureGtfs(src) {
+  const now = Date.now();
+  const due = !src.tripRoutes
+    ? now - src.gtfsLastAttempt >= GTFS_RETRY_MS || src.gtfsLastAttempt === 0
+    : now - src.gtfsLoadedAt >= GTFS_REFRESH_MS && now - src.gtfsLastAttempt >= GTFS_RETRY_MS;
+  if (due) {
+    src.gtfsInflight ??= loadGtfs(src).finally(() => {
+      src.gtfsInflight = null;
+    });
+  }
+  // Only block when there is no mapping yet; a periodic reload runs in the background.
+  return src.tripRoutes ? undefined : src.gtfsInflight;
 }
 
 // Count kept trips per start_date, to keep an eye on the start_date lagging
@@ -60,91 +140,116 @@ function startDates(feed) {
   return counts;
 }
 
-async function refresh() {
+async function refresh(src) {
+  await ensureGtfs(src);
+  if (!src.tripRoutes) {
+    log({ source: src.name, status: 'error', error: 'static GTFS not loaded yet, cannot map trips to routes' });
+    return;
+  }
+
   const headers = {};
-  if (cache?.etag) headers['if-none-match'] = cache.etag;
+  if (src.etag && src.feed) headers['if-none-match'] = src.etag;
 
   let res;
   let bytes;
   try {
-    res = await fetch(SRC_URL, { headers, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
-    if (res.status === 304 && cache) {
-      cache.fetchedAt = Date.now();
+    res = await fetch(src.rtUrl, { headers, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+    if (res.status === 304 && src.feed) {
+      src.fetchedAt = Date.now();
       log({
+        source: src.name,
         upstream_bytes: 0,
-        upstream_entities: cache.upstreamEntities,
-        kept_entities: cache.keptEntities,
-        output_bytes: cache.body.length,
-        upstream_last_modified: cache.lastModified,
+        upstream_entities: src.upstreamEntities,
+        kept_entities: src.feed.entity.length,
+        upstream_last_modified: src.lastModified,
         status: 'not_modified',
       });
       return;
     }
     if (res.status !== 200) throw new Error(`upstream HTTP ${res.status}`);
     bytes = new Uint8Array(await res.arrayBuffer());
-    // Seen on the real feed: Front Door sometimes serves a 0-byte 200 for ~30 s
-    // (blob caught mid-rewrite). Treat it as an upstream failure.
+    // Seen on the real feeds: Front Door sometimes serves a 0-byte 200 for
+    // ~30 s (blob caught mid-rewrite). Treat it as an upstream failure.
     if (bytes.length === 0) throw new Error('upstream returned an empty body');
 
-    const source = FeedMessage.decode(bytes);
-    const filtered = filterFeed(source, TRIP_PREFIXES);
-    const body = Buffer.from(FeedMessage.encode(filtered).finish());
-    const lastModified = res.headers.get('last-modified');
+    const upstream = FeedMessage.decode(bytes);
+    const feed = filterFeed(upstream, ROUTE_IDS, src.tripRoutes);
+    const unmapped = upstream.entity.filter(
+      (e) => e.tripUpdate && !e.tripUpdate.trip?.routeId && !src.tripRoutes.has(e.tripUpdate.trip?.tripId),
+    ).length;
 
-    cache = {
-      body,
+    Object.assign(src, {
+      feed,
+      version: src.version + 1,
       etag: res.headers.get('etag'),
-      lastModified,
-      upstreamBytes: bytes.length,
-      upstreamEntities: source.entity.length,
-      keptEntities: filtered.entity.length,
+      lastModified: res.headers.get('last-modified'),
+      upstreamEntities: upstream.entity.length,
       fetchedAt: Date.now(),
-    };
+    });
     log({
+      source: src.name,
       upstream_bytes: bytes.length,
-      upstream_entities: source.entity.length,
-      kept_entities: filtered.entity.length,
-      output_bytes: body.length,
-      upstream_last_modified: lastModified,
+      upstream_entities: upstream.entity.length,
+      kept_entities: feed.entity.length,
+      output_bytes: FeedMessage.encode(feed).finish().length,
+      upstream_last_modified: src.lastModified,
       status: 'ok',
-      ...(filtered.entity.length === 0 && {
-        warning: `no entity matched prefixes ${TRIP_PREFIXES.join(',')}`,
-      }),
-      kept_start_dates: startDates(filtered),
+      // Trips absent from the static GTFS can't be mapped to a route and are
+      // dropped; a growing count means the static GTFS is out of date.
+      unmapped_entities: unmapped,
+      ...(feed.entity.length === 0 && { warning: 'no entity matched ROUTE_IDS' }),
+      kept_start_dates: startDates(feed),
     });
   } catch (err) {
-    const age = cache ? Date.now() - cache.fetchedAt : null;
+    const age = src.feed ? Date.now() - src.fetchedAt : null;
     log({
+      source: src.name,
       upstream_bytes: bytes?.length ?? null,
       upstream_entities: null,
       kept_entities: null,
       output_bytes: null,
       upstream_last_modified: res?.headers.get('last-modified') ?? null,
       status: 'error',
-      error: err.name === 'TimeoutError' ? `upstream timeout after ${UPSTREAM_TIMEOUT_MS} ms` : err.message,
+      error: errorMessage(err, UPSTREAM_TIMEOUT_MS),
       cache_age_ms: age,
-      serving: age !== null && age < MAX_STALE_MS ? 'stale_cache' : '502',
+      serving: age !== null && age < MAX_STALE_MS ? 'stale_cache' : 'dropped',
     });
   }
 }
 
-// Returns the cache entry to serve, or null if there is nothing fresh enough.
+let output = null; // { key, body }
+
+// Returns what to serve, or null if no source has data fresh enough.
 async function getFeed() {
-  if (!cache || Date.now() - cache.fetchedAt >= CACHE_TTL_MS) {
-    // Concurrent requests during a refresh share the same upstream fetch.
-    inflight ??= refresh().finally(() => {
-      inflight = null;
-    });
-    await inflight;
+  await Promise.all(
+    sources
+      .filter((s) => Date.now() - s.fetchedAt >= CACHE_TTL_MS)
+      // Concurrent requests during a refresh share the same upstream fetch.
+      .map((s) => (s.inflight ??= refresh(s).finally(() => (s.inflight = null)))),
+  );
+
+  const now = Date.now();
+  const live = sources.filter((s) => s.feed && now - s.fetchedAt < MAX_STALE_MS);
+  if (live.length === 0) return null;
+
+  // Re-encode only when a source got new data or the set of live sources changed.
+  const key = live.map((s) => `${s.name}@${s.version}`).join(',');
+  if (output?.key !== key) {
+    output = { key, body: Buffer.from(FeedMessage.encode(mergeFeeds(live.map((s) => s.feed))).finish()) };
   }
-  if (cache && Date.now() - cache.fetchedAt < MAX_STALE_MS) return cache;
-  return null;
+  return {
+    body: output.body,
+    oldestFetchedAt: Math.min(...live.map((s) => s.fetchedAt)),
+    missing: sources.filter((s) => !live.includes(s)).map((s) => s.name),
+  };
 }
+
+const FEED_PATHS = new Set(['/gtfs-rt/trip-updates.pb', '/gtfs-rt/cfp.pb']);
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const { pathname } = url;
-  const known = pathname === '/gtfs-rt/cfp.pb' || pathname === '/healthz';
+  const known = FEED_PATHS.has(pathname) || pathname === '/healthz';
 
   if (!known) {
     res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
@@ -177,16 +282,25 @@ const server = http.createServer(async (req, res) => {
       // hand it to clients without one.
       'cache-control': 'private, max-age=15',
       'content-length': feed.body.length,
-      // Seconds since the proxy last confirmed this data with upstream, so a
-      // stale response is never silent for the client either.
-      age: Math.floor((Date.now() - feed.fetchedAt) / 1000),
-      ...(feed.lastModified && { 'last-modified': feed.lastModified }),
+      // Seconds since the proxy last confirmed the oldest part of this data
+      // with upstream, so a stale response is never silent for the client.
+      age: Math.floor((Date.now() - feed.oldestFetchedAt) / 1000),
+      // A source down for more than MAX_STALE_MS is left out rather than
+      // served stale; say so instead of silently shrinking the feed.
+      ...(feed.missing.length && { 'x-missing-sources': feed.missing.join(',') }),
     })
     .end(feed.body);
 });
 
 server.listen(PORT, () => {
-  log({ status: 'listening', port: PORT, src_url: SRC_URL, trip_prefixes: TRIP_PREFIXES });
+  log({
+    status: 'listening',
+    port: PORT,
+    route_ids: [...ROUTE_IDS],
+    sources: sources.map((s) => ({ name: s.name, rt_url: s.rtUrl, gtfs_url: s.gtfsUrl })),
+  });
+  // Warm the static GTFS so the first client request doesn't pay for it.
+  for (const s of sources) ensureGtfs(s);
 });
 
 // Node as PID 1 in Docker ignores SIGTERM by default; exit cleanly instead.
