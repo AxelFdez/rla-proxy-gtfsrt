@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
-import { filterFeed, mergeFeeds, parseList } from '../filter.js';
+import { dropFinishedTrips, filterFeed, lastStopTime, mergeFeeds, parseList } from '../filter.js';
 
 const { FeedMessage, FeedHeader } = GtfsRealtimeBindings.transit_realtime;
 
@@ -133,6 +133,47 @@ test('mergeFeeds concatenates entities and keeps the oldest timestamp', () => {
   assert.equal(merged.header.gtfsRealtimeVersion, '2.0');
   assert.equal(merged.header.incrementality, FeedHeader.Incrementality.FULL_DATASET);
   assert.equal(Number(a.header.timestamp), TIMESTAMP, 'inputs are not mutated');
+});
+
+function timedEntity(id, ...times) {
+  return {
+    id,
+    tripUpdate: {
+      trip: { tripId: `CFP:${id}` },
+      stopTimeUpdate: times.map((time, i) => ({
+        stopId: `CFP:0-${i + 1}`,
+        ...(i === times.length - 1 ? { arrival: { time } } : { departure: { time } }),
+      })),
+    },
+  };
+}
+
+test('dropFinishedTrips removes only trips whose last stop is before the cutoff', () => {
+  const cutoff = TIMESTAMP;
+  const src = fixture([
+    timedEntity('finished', cutoff - 3600, cutoff - 60),
+    timedEntity('running', cutoff - 3600, cutoff + 60),
+    timedEntity('exactly-at-cutoff', cutoff - 60, cutoff),
+    timedEntity('future', cutoff + 60, cutoff + 120),
+  ]);
+  assert.deepEqual(ids(dropFinishedTrips(src, cutoff)), ['running', 'exactly-at-cutoff', 'future']);
+  assert.equal(src.entity.length, 4, 'input is not mutated');
+});
+
+test('dropFinishedTrips looks at the latest stop, whatever the stop order', () => {
+  const src = fixture([timedEntity('unordered', TIMESTAMP + 60, TIMESTAMP - 60)]);
+  assert.deepEqual(ids(dropFinishedTrips(src, TIMESTAMP)), ['unordered']);
+});
+
+test('dropFinishedTrips keeps trips without any absolute time and the header', () => {
+  const src = fixture([
+    { id: 'delay-only', tripUpdate: { trip: { tripId: 'CFP:1' }, stopTimeUpdate: [{ stopId: 'A', arrival: { delay: 60 } }] } },
+    { id: 'no-stops', tripUpdate: { trip: { tripId: 'CFP:2' } } },
+  ]);
+  assert.equal(lastStopTime(src.entity[0]), 0);
+  const out = dropFinishedTrips(src, TIMESTAMP);
+  assert.deepEqual(ids(out), ['delay-only', 'no-stops']);
+  assert.equal(Number(out.header.timestamp), TIMESTAMP);
 });
 
 test('parseList trims and drops empty items', () => {

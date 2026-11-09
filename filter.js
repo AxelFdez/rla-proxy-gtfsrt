@@ -38,6 +38,32 @@ export function filterFeed(feed, routeIds, tripRoutes) {
 }
 
 /**
+ * Latest arrival or departure time of a TripUpdate, in epoch seconds, or 0 when
+ * none of its stops has an absolute time.
+ */
+export function lastStopTime(entity) {
+  let last = 0;
+  for (const stop of entity.tripUpdate?.stopTimeUpdate ?? []) {
+    last = Math.max(last, Number(stop.arrival?.time ?? 0), Number(stop.departure?.time ?? 0));
+  }
+  return last;
+}
+
+/**
+ * Remove the trips whose last stop is before `cutoffSeconds`. The source feeds
+ * keep the previous day's finished trips, and their trip_id comes back every
+ * day, so a consumer could apply them to today's trip. A trip with no absolute
+ * time is kept: nothing says it is over. Pure: the input feed is not mutated.
+ */
+export function dropFinishedTrips(feed, cutoffSeconds) {
+  const entity = (feed.entity ?? []).filter((e) => {
+    const last = lastStopTime(e);
+    return last === 0 || last >= cutoffSeconds;
+  });
+  return FeedMessage.create({ header: feed.header, entity });
+}
+
+/**
  * Concatenate the entities of several FULL_DATASET feeds into one. The header
  * is the first feed's, with the oldest timestamp so the merged feed never
  * claims to be fresher than its stalest part.

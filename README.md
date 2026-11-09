@@ -70,6 +70,7 @@ Une clé passée dans l'URL peut se retrouver dans les logs d'accès (Traefik, c
 | `CACHE_TTL_MS` | `15000` | durée avant un nouveau fetch temps réel |
 | `MAX_STALE_MS` | `120000` | âge max du cache d'une source servi quand elle échoue |
 | `GTFS_REFRESH_MS` | `21600000` (6 h) | intervalle de rechargement des GTFS statiques |
+| `FINISHED_GRACE_MS` | `1800000` (30 min) | délai après le dernier arrêt d'une course avant de la retirer du flux |
 
 `SOURCES` par défaut :
 ```
@@ -84,13 +85,15 @@ https://proxy-data.zou.maregionsud.fr/GTFS-RT/GTFS-RT_trips_ZOU_proximite.pb|htt
 - Le refresh temps réel se fait à la demande, source par source. Les requêtes concurrentes pendant un refresh partagent un seul fetch par source.
 - Le fetch temps réel a un timeout de 8 s et utilise un GET conditionnel (`If-None-Match`) : sur un 304, seul l'horodatage du cache est rafraîchi.
 - Si une source échoue (erreur réseau, timeout, HTTP ≠ 200, **corps vide**), son cache reste servi tant qu'il a moins de `MAX_STALE_MS`. Passé ce délai, ses trips sont retirés et l'en-tête `x-missing-sources` le signale. Si plus aucune source n'est disponible, la route renvoie 502. Les deux flux renvoient parfois un 200 de 0 octet pendant ~30 s (blob capturé en pleine réécriture puis mis en cache par Front Door) ; c'est traité comme un échec.
+- Les courses terminées sont retirées : si le dernier arrêt d'un trip est passé depuis plus de `FINISHED_GRACE_MS`, il sort du flux. Les sources gardent les courses de la veille et leur `trip_id` revient chaque jour : un consommateur pourrait les appliquer à la course du jour. Un trip sans horaire absolu est conservé.
 - Les deux flux sont régénérés toutes les 30 s environ. Front Door les garde en cache 30 s.
 - Le ré-encodage via `gtfs-realtime-bindings` est octet pour octet identique à la source (vérifié sur le flux réel) : le filtre ne transforme pas les entités.
 - Logs : une ligne JSON par refresh et par source sur stdout, `{ts, source, upstream_bytes, upstream_entities, kept_entities, output_bytes, upstream_last_modified, status}`.
   - `status` vaut `ok`, `not_modified` ou `error`. Sur erreur s'ajoutent `error`, `cache_age_ms` et `serving` (`stale_cache` / `dropped`).
   - `unmapped_entities` : trips absents du GTFS statique.
+  - `finished_entities` : trips des lignes voulues retirés car terminés.
   - `warning` : présent quand aucune entité ne correspond.
-  - `kept_start_dates` : nombre de trips gardés par `start_date`, pour suivre les trips datés de la veille. On le loggue, on ne le corrige pas.
+  - `kept_start_dates` : nombre de trips gardés par `start_date`, pour suivre les trips datés de la veille encore en cours. On le loggue, la date n'est pas corrigée.
   - Le chargement des GTFS statiques loggue `gtfs_loaded` (avec `trips` et `wanted_trips`) ou `gtfs_error`.
   - Pas de log par requête cliente.
 

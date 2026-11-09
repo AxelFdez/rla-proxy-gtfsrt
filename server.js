@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
-import { filterFeed, mergeFeeds, parseList } from './filter.js';
+import { dropFinishedTrips, filterFeed, mergeFeeds, parseList } from './filter.js';
 import { tripRoutesFromGtfs } from './gtfs-static.js';
 
 const { FeedMessage } = GtfsRealtimeBindings.transit_realtime;
@@ -27,6 +27,7 @@ const PORT = Number(process.env.PORT ?? 3000);
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS ?? 15000);
 const MAX_STALE_MS = Number(process.env.MAX_STALE_MS ?? 120000);
 const GTFS_REFRESH_MS = Number(process.env.GTFS_REFRESH_MS ?? 6 * 3600 * 1000);
+const FINISHED_GRACE_MS = Number(process.env.FINISHED_GRACE_MS ?? 30 * 60 * 1000);
 const UPSTREAM_TIMEOUT_MS = 8000;
 const GTFS_TIMEOUT_MS = 60000;
 const GTFS_RETRY_MS = 60000;
@@ -140,6 +141,8 @@ function startDates(feed) {
   return counts;
 }
 
+const finishedCutoff = () => (Date.now() - FINISHED_GRACE_MS) / 1000;
+
 async function refresh(src) {
   await ensureGtfs(src);
   if (!src.tripRoutes) {
@@ -156,6 +159,12 @@ async function refresh(src) {
     res = await fetch(src.rtUrl, { headers, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
     if (res.status === 304 && src.feed) {
       src.fetchedAt = Date.now();
+      // An unchanged upstream feed still ages: trips can finish in the meantime.
+      const remaining = dropFinishedTrips(src.feed, finishedCutoff());
+      if (remaining.entity.length !== src.feed.entity.length) {
+        src.feed = remaining;
+        src.version += 1;
+      }
       log({
         source: src.name,
         upstream_bytes: 0,
@@ -173,7 +182,8 @@ async function refresh(src) {
     if (bytes.length === 0) throw new Error('upstream returned an empty body');
 
     const upstream = FeedMessage.decode(bytes);
-    const feed = filterFeed(upstream, ROUTE_IDS, src.tripRoutes);
+    const routed = filterFeed(upstream, ROUTE_IDS, src.tripRoutes);
+    const feed = dropFinishedTrips(routed, finishedCutoff());
     const unmapped = upstream.entity.filter(
       (e) => e.tripUpdate && !e.tripUpdate.trip?.routeId && !src.tripRoutes.has(e.tripUpdate.trip?.tripId),
     ).length;
@@ -197,6 +207,7 @@ async function refresh(src) {
       // Trips absent from the static GTFS can't be mapped to a route and are
       // dropped; a growing count means the static GTFS is out of date.
       unmapped_entities: unmapped,
+      finished_entities: routed.entity.length - feed.entity.length,
       ...(feed.entity.length === 0 && { warning: 'no entity matched ROUTE_IDS' }),
       kept_start_dates: startDates(feed),
     });
